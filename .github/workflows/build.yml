@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [ pc_port ]
+  # Any base branch, so pull requests stacked on other pull requests get checked too
   pull_request:
-    branches: [ pc_port ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,13 +20,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@master
 
-      - name: Checkout syms
-        if: ${{ github.event_name == 'push' }}
-        uses: actions/checkout@master
-        with:
-          path: symbols
-          ref: symbols
-
       - name: Checkout agbcc
         uses: actions/checkout@master
         with:
@@ -35,10 +29,33 @@ jobs:
       - name: Install binutils
         run: |
           sudo apt update
-          sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi libpng-dev
+          sudo apt install \
+            gcc-arm-none-eabi \
+            binutils-arm-none-eabi \
+            g++-mingw-w64-i686 \
+            g++-mingw-w64-x86-64 \
+            libpng-dev \
+            libsdl2-dev \
+            gdb
         # build-essential and git are already installed
         # gcc-arm-none-eabi is only needed for the modern build
         # as an alternative to dkP
+
+      - name: Install SDL2 MinGW libraries
+        run: |
+          # SDL's own site first, then the archive.org copy of the same file
+          downloaded=false
+          for url in https://www.libsdl.org/release/SDL2-devel-2.0.16-mingw.tar.gz \
+                     https://archive.org/download/sdl-2-2.0.16/SDL2-devel-2.0.16-mingw.tar.gz; do
+            if curl -fsSL --retry 3 --retry-all-errors -o SDL2-mingw.tar.gz "$url" &&
+               echo "2bfe48628aa9635c12eac7d421907e291525de1d0b04b3bca4a5bd6e6c881a6f  SDL2-mingw.tar.gz" | sha256sum -c -; then
+              downloaded=true
+              break
+            fi
+          done
+          $downloaded
+          tar -xzf SDL2-mingw.tar.gz
+          mv SDL2-2.0.16 SDL2
 
       - name: Install agbcc
         run: |
@@ -46,7 +63,9 @@ jobs:
           ./install.sh ../
         working-directory: agbcc
 
-      - name: Compare
+      - name: agbcc
+        env:
+          COMPARE: 0
         run: make -j${nproc} all syms
 
       - name: Modern
@@ -68,9 +87,20 @@ jobs:
       - name: Linux (64-bit)
         env:
           IS64BIT: 1
-        run: make -j${nproc} linux
+        # Debug info (it doesn't change the code) is needed by the data audit below
+        run: make -j${nproc} linux CFLAGS=-g
 
-      - name: Linux (32-bit)
-        env:
-          IS64BIT: 0
-        run: make -j${nproc} linux
+      - name: Headless tests (Linux 64-bit)
+        run: python3 test/headless/smoke.py ./pokeemerald64 --audit --out build/headless
+
+      - name: Upload headless test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-linux64
+          path: build/headless
+
+      #- name: Linux (32-bit)
+      #  env:
+      #    IS64BIT: 0
+      #  run: make -j${nproc} linux
