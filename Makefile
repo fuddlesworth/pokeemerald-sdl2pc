@@ -257,14 +257,16 @@ else ifeq ($(PORTABLE),1)
   PATH_MODERNCC := PATH="$(PATH)" $(MODERNCC)
   CPP := $(PREFIX)cpp -m$(BIT_WIDTH)
   CC1 	:= $(shell $(PREFIX)gcc --print-prog-name=cc1) -quiet
-  override CFLAGS += $(OS_CFLAGS) $(PLATFORM_CFLAGS) -Werror=implicit-function-declaration -Werror=incompatible-pointer-types -Werror=int-conversion -Werror=pointer-to-int-cast -Werror=int-to-pointer-cast -Wno-trigraphs -Wimplicit -Wparentheses -Wunused -m$(BIT_WIDTH) -std=gnu99 $(LEADING_UNDERSCORE_FLAG) -fno-dce -fno-builtin -Wno-unused-function -DPORTABLE -DNONMATCHING -D UBFIX -DMODERN=$(MODERN)
+  override CFLAGS += $(OS_CFLAGS) $(PLATFORM_CFLAGS) -Werror=implicit-function-declaration -Werror=incompatible-pointer-types -Werror=int-conversion -Werror=pointer-to-int-cast -Werror=int-to-pointer-cast -Wno-trigraphs -Wimplicit -Wparentheses -Wunused -m$(BIT_WIDTH) -std=gnu99 $(LEADING_UNDERSCORE_FLAG) -fno-common -fno-dce -fno-builtin -Wno-unused-function -DPORTABLE -DNONMATCHING -D UBFIX -DMODERN=$(MODERN)
   # GCC reports writes it can't rule out on paths the game never takes, like
   # GetMonData filling in a name with no buffer to write to, and which ones it
   # reports changes between versions
   override CFLAGS += -Wno-stringop-overflow
-  # CI builds with WERROR=1, so that new warnings fail the build
+  # CI builds with WERROR=1, so that new warnings fail the build. The
+  # preprocessor runs on its own, so it needs the flag too.
   ifeq ($(WERROR),1)
     override CFLAGS += -Werror
+    CPPFLAGS += -Werror
   endif
   # e.g. SANITIZE=address,undefined (Linux only). GCC defines shifting into the
   # sign bit (it's everywhere in GBA code), so that isn't reported.
@@ -387,6 +389,16 @@ OBJS_REL := $(patsubst $(OBJ_DIR)/%,%,$(OBJS))
 SUBDIRS  := $(sort $(dir $(OBJS)))
 $(shell mkdir -p $(SUBDIRS))
 
+# Make only compares timestamps, so rebuild everything when the flags change
+ifeq ($(SETUP_PREREQS),1)
+  BUILD_FLAGS := $(strip $(CC1) $(CPPFLAGS) $(CFLAGS) $(AS) $(ASFLAGS) $(PLATFORM_LFLAGS) $(OS_LFLAGS))
+  BUILD_FLAGS_FILE := $(OBJ_DIR)/build_flags.txt
+  ifneq ($(BUILD_FLAGS),$(strip $(shell cat $(BUILD_FLAGS_FILE) 2>/dev/null)))
+    $(shell printf '%s\n' '$(BUILD_FLAGS)' > $(BUILD_FLAGS_FILE))
+  endif
+  $(OBJS): $(BUILD_FLAGS_FILE)
+endif
+
 # Pretend rules that are actually flags defer to `make all`
 modern: all
 compare: all
@@ -485,6 +497,14 @@ endif
 # Dependency rules (for the *.c & *.s sources to .o files)
 # Have to be explicit or else missing files won't be reported.
 
+ifeq ($(PORTABLE),1)
+# The game's variables, which all start out zeroed, get a section of their own,
+# so that a soft reset can clear them like the GBA clears its RAM (see
+# RegisterRamReset in src/platform/system.c). The platform code's stay in .bss.
+GAME_RAM_SECTION = $(OBJCOPY) --rename-section .bss=gba_ram $@
+$(C_BUILDDIR)/platform/%.o: GAME_RAM_SECTION =
+endif
+
 # As a side effect, they're evaluated immediately instead of when the rule is invoked.
 # It doesn't look like $(shell) can be deferred so there might not be a better way (Icedude_907: there is soon).
 
@@ -492,11 +512,13 @@ $(C_BUILDDIR)/%.o: $(C_SUBDIR)/%.c
 ifneq ($(KEEP_TEMPS),1)
 	@echo "$(CC1) <flags> -o $@ $<"
 	@$(CPP) $(CPPFLAGS) $< | $(PREPROC) -i -g $(ASSETS_DIR_NAME) $< charmap.txt | $(CC1) $(CFLAGS) -o - - | cat - <(echo -e ".text\n\t.align\t2, 0") | $(AS) $(ASFLAGS) -o $@ -
+	@$(GAME_RAM_SECTION)
 else
 	@$(CPP) $(CPPFLAGS) $< -o $(C_BUILDDIR)/$*.i
 	@$(PREPROC) -g $(ASSETS_DIR_NAME) $(C_BUILDDIR)/$*.i charmap.txt | $(CC1) $(CFLAGS) -o $(C_BUILDDIR)/$*.s
 	@echo -e ".text\n\t.align\t2, 0\n" >> $(C_BUILDDIR)/$*.s
 	$(AS) $(ASFLAGS) -o $@ $(C_BUILDDIR)/$*.s
+	@$(GAME_RAM_SECTION)
 endif
 
 $(C_BUILDDIR)/%.d: $(C_SUBDIR)/%.c

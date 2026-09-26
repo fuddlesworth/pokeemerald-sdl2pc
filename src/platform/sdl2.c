@@ -5,6 +5,7 @@
 #include <time.h>
 
 #ifdef _WIN32
+#define NOMINMAX // global.h has its own
 #include <windows.h>
 #include <xinput.h>
 #endif
@@ -56,8 +57,6 @@ static u32 sTestFrame;
 static u64 sTestAudioHash;
 
 extern void AgbMain(void);
-extern void MainLoop(void);
-extern void DoSoftReset(void);
 
 int DoMain(void *param);
 void ProcessEvents(void);
@@ -67,6 +66,7 @@ static void ReadSaveFile(const char *path);
 static void StoreSaveFile(void);
 static void CloseSaveFile(void);
 
+static void InitInternalClock(void);
 static void UpdateInternalClock(void);
 
 static bool ParseArgs(int argc, char **argv);
@@ -85,6 +85,8 @@ int main(int argc, char **argv)
         return 1;
 
     ReadSaveFile(sSavePath);
+    // Before AgbMain, whose RtcInit reads it
+    InitInternalClock();
 
     if (sTestMode)
         return RunTestMode();
@@ -132,7 +134,7 @@ int main(int argc, char **argv)
     SDL_AudioSpec want;
 
     SDL_memset(&want, 0, sizeof(want)); /* or SDL_zero(want) */
-    want.freq = 42048;
+    want.freq = AUDIO_SAMPLE_RATE;
     want.format = AUDIO_F32;
     want.channels = 2;
     want.samples = 1024;
@@ -151,10 +153,6 @@ int main(int argc, char **argv)
     AgbMain();
 
     double accumulator = 0.0;
-
-    memset(&internalClock, 0, sizeof(internalClock));
-    internalClock.status = SIIRTCINFO_24HOUR;
-    UpdateInternalClock();
 
     bool isGameStepDrawn = false;
     while (isRunning)
@@ -177,7 +175,13 @@ int main(int argc, char **argv)
             {
                 //run game logic, draw frame and process DMAs and vblank
                 ENTER_VBLANK(); //you must be in VBlank before running a game tick
-                MainLoop();
+                if (!RunMainLoop())
+                {
+                    // Soft reset: drop the old sound, and start the next frame with MainLoop
+                    SDL_ClearQueuedAudio(1);
+                    accumulator -= fixedTimestep;
+                    continue;
+                }
                 if (!isGameStepDrawn)
                 {
                     VDraw(sdlTexture);
@@ -377,7 +381,7 @@ void ProcessEvents(void)
             case SDLK_r:
                 if (event.key.keysym.mod & (KMOD_LCTRL | KMOD_RCTRL))
                 {
-                    DoSoftReset();
+                    RequestSoftReset();
                 }
                 break;
             case SDLK_p:
@@ -528,6 +532,13 @@ void Platform_SetStatus(struct SiiRtcInfo *rtc)
     internalClock.status = rtc->status;
 }
 
+static void InitInternalClock(void)
+{
+    memset(&internalClock, 0, sizeof(internalClock));
+    internalClock.status = SIIRTCINFO_24HOUR;
+    UpdateInternalClock();
+}
+
 static void UpdateInternalClock(void)
 {
     struct tm *now;
@@ -603,13 +614,7 @@ void Platform_SetTime(struct SiiRtcInfo *rtc)
 
 void Platform_SetAlarm(u8 *alarmData)
 {
-    // TODO
-}
-
-void SoftReset(u32 resetFlags)
-{
-    puts("Soft Reset called. Exiting.");
-    exit(0);
+    // The game never sets an alarm
 }
 
 // All options take a value. Anything else is ignored, like before there were
@@ -757,24 +762,25 @@ static int RunTestMode(void)
 {
     static uint16_t image[DISPLAY_WIDTH * DISPLAY_HEIGHT];
 
-    cgb_audio_init(42048);
+    cgb_audio_init(AUDIO_SAMPLE_RATE);
     AgbMain();
-
-    memset(&internalClock, 0, sizeof(internalClock));
-    internalClock.status = SIIRTCINFO_24HOUR;
-    UpdateInternalClock();
 
     for (sTestFrame = 0; ReadTestInput(&keys); sTestFrame++)
     {
+        bool ranFrame;
+
         ENTER_VBLANK();
-        MainLoop();
+        ranFrame = RunMainLoop();
         memset(image, 0, sizeof(image));
         DrawFrame(image);
         REG_VCOUNT = 161;
-        RunDMAsAndVBlank();
-
         sTestAudioHash = 0xCBF29CE484222325ull;
-        AudioUpdate();
+        // After a soft reset, the next frame starts with MainLoop, like at startup
+        if (ranFrame)
+        {
+            RunDMAsAndVBlank();
+            AudioUpdate();
+        }
 
         if (sTestHashes != NULL)
             fprintf(sTestHashes, "%u %016llx %016llx\n", sTestFrame,
