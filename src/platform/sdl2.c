@@ -22,6 +22,7 @@
 #include "platform/framedraw.h"
 #include "platform/settings.h"
 #include "platform/system.h"
+#include "platform/test_state.h"
 
 extern void (*const gIntrTable[])(void);
 
@@ -57,6 +58,8 @@ static u32 sTestShotEvery;
 static time_t sTestClockBase = 1767268800; // 2026-01-01 12:00:00 UTC
 static u32 sTestFrame;
 static u64 sTestAudioHash;
+static FILE *sTestAudio;
+static FILE *sTestState;
 
 extern void AgbMain(void);
 
@@ -72,21 +75,26 @@ static void InitInternalClock(void);
 static void UpdateInternalClock(void);
 
 static bool ParseArgs(int argc, char **argv);
+static void WriteWavHeader(FILE *file, u32 dataSize);
 static void FindDataFiles(void);
 static void ToggleFullscreen(void);
 static int RunTestMode(void);
 
 int main(int argc, char **argv)
 {
-    // Open an output console on Windows
-#ifdef _WIN32
-    AllocConsole() ;
-    AttachConsole( GetCurrentProcessId() ) ;
-    freopen( "CON", "w", stdout ) ;
-#endif
-
     if (!ParseArgs(argc, argv))
         return 1;
+
+    // Open an output console on Windows. The test mode keeps stdout, which the
+    // headless tests can read the game's state from.
+#ifdef _WIN32
+    if (!sTestMode)
+    {
+        AllocConsole() ;
+        AttachConsole( GetCurrentProcessId() ) ;
+        freopen( "CON", "w", stdout ) ;
+    }
+#endif
 
     // The test mode only uses files it's given, apart from the save
     if (!sTestMode)
@@ -218,16 +226,11 @@ int main(int argc, char **argv)
                     isGameStepDrawn = true;
                 }
                 RunDMAsAndVBlank();
+                // The sound engine runs once a frame, like in the GBA's VBlank
+                // interrupt, so the music keeps time with the game
+                AudioUpdate();
 
                 accumulator -= fixedTimestep;
-            }
-
-            //samples per frame is 701, that gets multipled by two when being queued and then multipled by four because samples are float32 which are 4 bytes long hence the divide by 8
-            //this number is then checked against samples per frame multipled by three rounded down to 2000 to give it enough margin of error while not desyncing
-            //this is all done to sync audio to gameplay
-            if (SDL_GetQueuedAudioSize(1)/8 < 2000)
-            {
-                AudioUpdate();
             }
 
             if (videoScaleChanged)
@@ -325,9 +328,30 @@ static u64 HashBytes(u64 hash, const void *data, size_t size)
 void Platform_QueueAudio(float *audioBuffer, s32 samplesPerFrame)
 {
     if (sTestMode)
+    {
         sTestAudioHash = HashBytes(sTestAudioHash, audioBuffer, samplesPerFrame);
+        if (sTestAudio != NULL)
+            fwrite(audioBuffer, 1, samplesPerFrame, sTestAudio);
+    }
     else
+    {
+        // The game makes a frame of sound every frame, and the device plays it
+        // at the same rate, so the queue only needs fixing when the two come
+        // apart. After a stall it runs dry: start it again with a little silence
+        // in front, so the next frames don't run dry too. When the game gets
+        // ahead, like when it's sped up, drop what can't be played in time.
+        static const float sSilence[MIXED_AUDIO_BUFFER_SIZE * 2];
+        Uint32 queued = SDL_GetQueuedAudioSize(1);
+
+        if (queued > (Uint32)samplesPerFrame * 8)
+            return;
+        if (queued == 0)
+        {
+            for (int i = 0; i < 3; i++)
+                SDL_QueueAudio(1, sSilence, samplesPerFrame);
+        }
         SDL_QueueAudio(1, audioBuffer, samplesPerFrame);
+    }
 }
 
 
@@ -574,7 +598,7 @@ static bool ParseArgs(int argc, char **argv)
         else if (strcmp(arg, "--test-input") == 0)
         {
             sTestMode = true;
-            sTestInput = fopen(value, "r");
+            sTestInput = (strcmp(value, "-") == 0) ? stdin : fopen(value, "r");
             if (sTestInput == NULL)
             {
                 fprintf(stderr, "Could not open test input %s\n", value);
@@ -593,6 +617,25 @@ static bool ParseArgs(int argc, char **argv)
         else if (strcmp(arg, "--test-shots") == 0)
         {
             sTestShotDir = value;
+        }
+        else if (strcmp(arg, "--test-state") == 0)
+        {
+            sTestState = (strcmp(value, "-") == 0) ? stdout : fopen(value, "w");
+            if (sTestState == NULL)
+            {
+                fprintf(stderr, "Could not open state output %s\n", value);
+                return false;
+            }
+        }
+        else if (strcmp(arg, "--test-audio") == 0)
+        {
+            sTestAudio = fopen(value, "wb");
+            if (sTestAudio == NULL)
+            {
+                fprintf(stderr, "Could not open audio output %s\n", value);
+                return false;
+            }
+            WriteWavHeader(sTestAudio, 0);
         }
         else if (strcmp(arg, "--test-shot-every") == 0)
         {
@@ -651,12 +694,20 @@ static bool ReadTestInput(u16 *outKeys)
     };
     static u32 sHoldFrames;
     static u16 sHoldKeys;
+    static bool sStateWritten;
     char line[256];
 
     while (sHoldFrames == 0)
     {
         char buttons[200];
 
+        // The state after the last line's frames, for a driver that decides
+        // what to press next from it (see test/headless/driver.py)
+        if (sTestState != NULL && !sStateWritten)
+        {
+            WriteTestState(sTestState, sTestFrame);
+            sStateWritten = true;
+        }
         if (fgets(line, sizeof(line), sTestInput) == NULL)
             return false;
         if (line[0] == '#' || sscanf(line, "%u %199s", &sHoldFrames, buttons) != 2)
@@ -665,6 +716,7 @@ static bool ReadTestInput(u16 *outKeys)
             continue;
         }
 
+        sStateWritten = false;
         sHoldKeys = 0;
         Input_ReleaseTestInputs();
         for (char *name = strtok(buttons, "+"); name != NULL; name = strtok(NULL, "+"))
@@ -689,6 +741,24 @@ static bool ReadTestInput(u16 *outKeys)
     sHoldFrames--;
     *outKeys = sHoldKeys | Input_GetTestButtons();
     return true;
+}
+
+// A WAV file header for the test mode's audio: 32-bit float stereo, with
+// dataSize bytes of samples after it
+static void WriteWavHeader(FILE *file, u32 dataSize)
+{
+    u8 header[44];
+    u32 fields[] = {36 + dataSize, 16, 3 | (2 << 16), AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_RATE * 8, 8 | (32 << 16), dataSize};
+
+    memcpy(header, "RIFF", 4);
+    memcpy(header + 8, "WAVEfmt ", 8);
+    memcpy(header + 36, "data", 4);
+    // Little-endian, like every platform the port runs on
+    memcpy(header + 4, &fields[0], 4);
+    memcpy(header + 16, &fields[1], 16);
+    memcpy(header + 32, &fields[5], 4);
+    memcpy(header + 40, &fields[6], 4);
+    fwrite(header, 1, sizeof(header), file);
 }
 
 static void WriteTestScreenshot(const uint16_t *image)
@@ -758,6 +828,14 @@ static int RunTestMode(void)
         WriteTestScreenshot(image);
     if (sTestHashes != NULL)
         fclose(sTestHashes);
+    if (sTestAudio != NULL)
+    {
+        long size = ftell(sTestAudio);
+
+        fseek(sTestAudio, 0, SEEK_SET);
+        WriteWavHeader(sTestAudio, size - 44);
+        fclose(sTestAudio);
+    }
     fclose(sTestInput);
     CloseSaveFile();
     return 0;
